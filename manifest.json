@@ -5,9 +5,9 @@
     {
       "id": "yandex",
       "name": "Yandex 视频",
-      "version": "1.0.0",
+      "version": "1.2.0",
       "url": "plugins/yandex.js",
-      "description": "Yandex 视频元搜索：搜索、详情、来源标注；播放按 直链 / 播放页 / 外部打开 三级降级。"
+      "description": "Yandex 视频元搜索：搜索、详情、封面；VK（四档 mp4）、NTV、Dzen 可直接播放。"
     }
   ]
 }
