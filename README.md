@@ -1,8 +1,8 @@
 # Yandex 视频 —— HGhub 插件（HPP 1.0）
 
 **文件**：`yandex.js`（9.4 KB，单文件，无依赖）
-**协议**：HPP 1.0（HGhub v0.0.2 宿主）
-**写于**：2026-11-17 · 自测通过（假宿主 + 真实 Yandex 页面）
+**协议**：HPP 1.0 · 目标宿主 HGhub v0.0.2（Android / 桌面）
+**验证**：2026-11-18 复测，QuickJS-ng 0.18.0 与 0.10.1 双引擎跑通，真实 Yandex 页面数据
 
 ## 它做什么
 
@@ -10,52 +10,70 @@
 
 | 能力 | 实现 |
 |---|---|
-| 搜索 | `yandex.ru/video/search?text=<词>`，翻页 `&p=N`，从页面内嵌 `UniAppVideo-PreloadedState` 取结构化数据 |
-| 详情 | `/video/preview/<videoId>`，返回标题、封面、时长、来源站点、观看数、发布日期 |
-| 播放 | 分三级：① 页面里若有 m3u8/mp4 直链 → `media`；② 嵌入播放页 → `page` + `resolverId`（如 rutube）；③ 兜底 → `external`（交给系统浏览器打开来源页） |
+| 搜索 | `yandex.ru/video/search?text=<词>`，翻页 `&p=N`，从页面内嵌 `noframes#UniAppVideo-PreloadedState` 取结构化 JSON |
+| 详情 | `/video/preview/<videoId>`，标题、封面、时长、来源站点、观看数、发布日期 |
+| 播放 | 三级降级：① 页面有 m3u8/mp4 直链 → `media`；② 嵌入播放页 → `page` + `resolverId`；③ 兜底 → `external` 交给系统浏览器 |
 
-## 为什么播放要分级
+## APK 侧运行环境（实测自 `HGhub_0.0.2_arm64.apk`）
 
-Yandex 是**元搜索**：它自己不托管视频，条目落在 rutube、VK Видео、Mail.ru、dzen 等站点。
-所以插件能给的是"找到片"，能不能在应用内直接播，取决于对应来源的解析器是否安装、以及网络能不能到那个源站。
+从安装包里挖出来的事实，不是推测：
 
-**实测（2026-11-17，本机）**：
+| 项 | 值 | 证据 |
+|---|---|---|
+| 包名 | `com.hghub.player` | `assets/tauri.conf.json` |
+| 原生库 | `lib/arm64-v8a/libhuangguo_client_lib.so`（10.76 MB，单库） | APK 内仅一个 .so |
+| 插件运行时 | **rquickjs-core 0.12.2 + QuickJS-ng** | .so 内 `rquickjs-core-0.12.2/src/...`、`QuickJS-ng memory usage -- %s version` |
+| HPP 实现位置 | `crates/hpp/src/*`（runtime/manager/capabilities/media/network …） | .so 内源码路径字符串 |
+| 构建链 | rustc 1.100.0，clang 22，2026-11-09 | .so 内版本串 |
 
-- `yandex.ru` 直连 200，无需代理；搜索/预览页均无验证码。
-- `rutube.ru` **直连超时**，走 127.0.0.1:7900 代理才 200；且其公开接口不再返回 m3u8（`api/video/<id>/` 的 `video_balancer` 为空，`api/play/options/` 返回 244/404）。
-- VK Видео同样需要专门解析。
+**所以插件是跑在 QuickJS-ng 上，不是 V8 / JSC。** 本插件已在两个 QuickJS-ng 版本上实测：
 
-结论：**在国内网络、手机端（走设备网络、没有代理）下，这个源的播放大概率落到"外部打开"这一档**。搜索、浏览、详情完全可用。
+| 引擎 | 结果 |
+|---|---|
+| QuickJS-ng **0.18.0** | `SEARCH items=17 next=2` / DETAIL ok / `PLAYBACK page(rutube)+external` / `QUICKJS_OK` |
+| QuickJS-ng **0.10.1**（rquickjs 0.12.2 同代） | 同上，完全一致 |
+
+代码只用 ES2017 级语法（无 `?.`、`??`、`replaceAll`、`.at()`、`matchAll`、`Object.fromEntries`），已扫描确认。
+
+## 网络实测（2026-11-18，本机直连，未走代理）
+
+| 目标 | 结果 |
+|---|---|
+| `yandex.ru/video/search` | **6/6 成功**，2.43–2.93s，每次 52 个 videoId，492 字节级内容完整 |
+| `yandex.ru/video/preview` | 3/3 200，2.0–2.4s |
+| TLS | TLSv1.3 / GlobalSign GCC E46 OV TLS CA 2025 / 证书 `*.yandex.ru`，YANDEX LLC，2026-10-12 → 2027-04-29 |
+| DNS | yandex.ru → 5.255.255.77 / 77.88.44.55 / 77.88.55.88（Yandex 自有网段） |
+| 封面 CDN `avatars.mds.yandex.net` | 解析正常（87.250.247.181-183） |
+| `yandex.ru` 首页 | ⚠️ TLS 证书链校验失败（`unable to get local issuer certificate`）——本插件不依赖首页 |
+| `rutube.ru` | ❌ 3/3 连接超时（10060），IP 199.96.62.75；走 127.0.0.1:7900 代理才 200 |
+| `vk.com` 桌面 | ❌ 连接超时；`m.vk.com` 200 但页面不吐直链 |
+
+结论：**Yandex 搜索/详情链路稳定可用；播放源（rutube / VK）在国内直连拿不到。** 手机走同一宽带 Wi-Fi 时结果基本一致；走 4G 会因运营商路由不同可能有差异。
 
 ## 安装
 
-1. 打开 HGhub → 插件中心 → 导入与订阅
-2. 选"插件文件"，选本目录下的 `yandex.js`
-3. 确认状态为"已就绪"，在设置里把首页来源或搜索来源切到"Yandex 视频"
-
-也可以放进你自己的插件列表仓库，把 `yandex.js` 加到 `manifest.json` 的 `plugins` 数组，`url` 写相对路径。
-
-## 配置项
-
-- 站点线路：`yandex.ru` / `yandex.com`（`endpoints.list()`），设置里可切换。
-- 语言头默认 `ru,en;q=0.9`，改 `meta.defaultHeaders` 即可。
+1. HGhub → 插件中心 → 导入与订阅
+2. 粘订阅地址（推荐 jsDelivr，直连实测 200）：
+   `https://cdn.jsdelivr.net/gh/Beihaisir/HGhub-plugins@main/manifest.json`
+3. 或直接用文件导入本目录的 `yandex.js`
+4. 确认状态"已就绪"，把搜索来源切到"Yandex 视频"
 
 ## 已知限制
 
-- 首页无内容（Yandex 没有稳定的无参视频首页），只用搜索入口。
-- 没有分类目录，Yandex 视频侧不提供。
-- 搜索结果里的时长/观看数是 Snippet 自带值，可能与来源站点实际不一致。
-- 页面结构若改版（`UniAppVideo-PreloadedState` 改名或换位置），插件会报 `UPSTREAM_CHANGED`。
+- 首页无内容（Yandex 没有稳定的无参视频首页），只有搜索入口；无分类目录。
+- 播放受上游来源网络可达性限制，见上表。真要片源得配解析器或用社区影视源。
+- 页面若改版（`UniAppVideo-PreloadedState` 改名/换位）会报 `UPSTREAM_CHANGED`。
+- 时长/观看数取 Snippet 自带值，可能与来源站实际不一致。
 
-## 自测结果（真实请求）
+## 实测输出（QuickJS-ng 0.10.1，真实页面）
 
 ```
-meta: yandex Yandex 视频 1.0.0
-SEARCH items = 17 | next = 2
-  1. 15167207815821873403 | Матрица | The Matrix (1999) | Rutube | 2ч 16 мин · 348,4K 次观看
-  2. 163315510202561215 | Шматрица (1999) — Видео от Наши 90-е | VK Видео | ...
-DETAIL: { id, title, type: movie, playlists[1], cover: avatars.mds.yandex.net/..., durationSec: 8176 }
-PLAYBACK:
-   kind=page     resolver=rutube  https://rutube.ru/play/embed/06f4c1.../?autoStart=true&wmode=opaque
-   kind=external                  http://rutube.ru/video/06f4c1dd1b319392aedc768867b4980f/
+meta=yandex 1.0.0 | search bytes=391747 preview bytes=268561
+SEARCH items=17 next=2
+  1. Матрица | The Matrix (1999) | Rutube | 2ч 16 мин · 348,4K 次观看 | cover=y
+  2. Матрица (фильм 1999) / The Matrix | Rutube | 2ч 16 мин · 1,5M 次观看 | cover=y
+  3. Матрица (1999) | Фильм.  4K — Видео от PLAYКино | VK Видео | 2ч 2 мин · 6,4K 次观看 | cover=y
+DETAIL title=Матрица | The Matrix (1999) cover=yes eps=1
+PLAYBACK page(rutube) + external
+QUICKJS_OK
 ```
