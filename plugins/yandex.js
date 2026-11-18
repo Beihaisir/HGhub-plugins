@@ -4,11 +4,12 @@
 export const meta = {
   id: 'yandex',
   name: '俄网搜索',
-  version: '1.4.0',
+  version: '1.5.0',
   protocol: 1,
-  description: '网页搜索（Bing 后端，可搜俄语站）+ 任意链接提取视频 + VK 四档直链播放。',
+  description: 'Yandex 网页搜索（含验证码 webview 过检）；Yandex 不可用时回落 Bing；支持贴链接提取视频与 VK 直链播放。',
   author: 'workspace',
   kind: 'source',
+  features: ['webview'],
   linkDomains: ['yandex.ru', 'yandex.com'],
   defaultHeaders: {
     'Accept-Language': 'ru,en;q=0.9',
@@ -320,6 +321,121 @@ export default function (hg) {
     return items;
   }
 
+  function isCaptchaPage(html) {
+    const s = String(html || '');
+    return /showcaptcha/i.test(s)
+      || /class="[^"]*CheckboxCaptcha/i.test(s)
+      || /SmartCaptcha/i.test(s)
+      || /Подтвердите, что запросы отправляли вы/i.test(s)
+      || /Are you not a robot/i.test(s);
+  }
+
+  function hasWebview() {
+    try {
+      if (!hg.webview || typeof hg.webview.open !== 'function') return false;
+      const f = hg.env && hg.env.features;
+      return !!(f && f.indexOf && f.indexOf('webview') >= 0);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Yandex 网页搜索结果解析：按结果项切块，优先 OrganicTitle-Link，兜底扫外链
+  function pickAnchor(seg) {
+    let m = /<a[^>]*class="[^"]*OrganicTitle-Link[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]{0,300}?)<\/a>/i.exec(seg);
+    if (!m) m = /<a[^>]*href="([^"]+)"[^>]*class="[^"]*OrganicTitle-Link[^"]*"[^>]*>([\s\S]{0,300}?)<\/a>/i.exec(seg);
+    if (m) return m;
+    const re = /<a[^>]*href="(https?:\/\/(?!(?:[a-z0-9-]+\.)*yandex\.[a-z.]|yastatic\.net)[^"]+)"[^>]*>([\s\S]{0,300}?)<\/a>/i;
+    return re.exec(seg);
+  }
+
+  function parseYandexWeb(html) {
+    const items = [];
+    const seen = {};
+    const text = String(html || '');
+    const push = function (url, title, snippet) {
+      if (!url || !title) return;
+      if (!/^https?:\/\//i.test(url)) return;
+      const hm = /^https?:\/\/([^\/?#]+)/i.exec(url);
+      if (!hm) return;
+      const host = hm[1];
+      if (/(^|\.)yandex\.[a-z.]+$/i.test(host) || /(^|\.)yastatic\.net$/i.test(host) || /(^|\.)ya\.ru$/i.test(host)) return;
+      if (seen[url]) return;
+      if (title.length < 3) return;
+      seen[url] = 1;
+      const it = { id: url, title: title.slice(0, 130), type: 'other' };
+      it.badge = host.replace(/^www\./, '').slice(0, 14);
+      const sub = [];
+      if (host) sub.push(host.replace(/^www\./, ''));
+      if (snippet && snippet.length > 8) sub.push(snippet.slice(0, 70));
+      if (sub.length) it.subtitle = sub.join(' · ');
+      items.push(it);
+    };
+
+    // 按结果项切块
+    let blocks = text.split(/<li[^>]+class="[^"]*serp-item/i);
+    if (blocks.length < 3) blocks = text.split(/<div[^>]+class="[^"]*serp-item/i);
+    if (blocks.length < 3) blocks = text.split(/class="[^"]*Organic(?=[ _"])/i);
+
+    for (let i = 1; i < blocks.length && items.length < 20; i++) {
+      const seg = blocks[i].slice(0, 6000);
+      const a = pickAnchor(seg);
+      if (!a) continue;
+      const url = decodeEntities(a[1]);
+      const title = stripTags(a[2]);
+      let sn = '';
+      const sm = /class="[^"]*OrganicTextContentSpan[^"]*"[^>]*>([\s\S]{0,400}?)<\/span>/i.exec(seg)
+        || /class="[^"]*OrganicText[^"]*"[^>]*>([\s\S]{0,400}?)<\/div>/i.exec(seg);
+      if (sm) sn = stripTags(sm[1]);
+      push(url, title, sn);
+    }
+
+    // 兜底：整页扫外链
+    if (!items.length) {
+      const re = /<a[^>]*href="(https?:\/\/(?!(?:[a-z0-9-]+\.)*yandex\.[a-z.]|yastatic\.net)[^"]+)"[^>]*>([\s\S]{0,250}?)<\/a>/gi;
+      let m;
+      while ((m = re.exec(text)) !== null && items.length < 20) {
+        push(decodeEntities(m[1]), stripTags(m[2]), '');
+      }
+    }
+    return items;
+  }
+
+  async function yandexWebSearch(q, page, ctx) {
+    const base = origin();
+    let url = base + '/search/?text=' + encodeURIComponent(q);
+    if (page > 1) url += '&p=' + (page - 1);
+    let html = '';
+    try {
+      html = await fetchText(url, ctx);
+    } catch (e) {
+      return null;
+    }
+    if (isCaptchaPage(html)) {
+      if (!hasWebview()) return null;
+      try {
+        await hg.webview.open({
+          url: base + '/search/?text=' + encodeURIComponent(q),
+          title: '过 Yandex 验证',
+          doneWhen: { cookieNames: ['spravka'] },
+          timeoutSec: 180,
+        });
+      } catch (e) {
+        return null;
+      }
+      try {
+        html = await fetchText(url, ctx);
+      } catch (e) {
+        return null;
+      }
+      if (isCaptchaPage(html)) return null;
+    }
+    const items = parseYandexWeb(html);
+    if (!items.length) return null;
+    const hasNext = items.length >= 5;
+    return { items: items, next: hasNext ? String(page + 1) : null };
+  }
+
   async function bingSearch(q, page, ctx) {
     const first = (page - 1) * 10 + 1;
     let url = 'https://cn.bing.com/search?q=' + encodeURIComponent(q) + '&setlang=ru&count=20';
@@ -413,7 +529,10 @@ export default function (hg) {
         }
 
         const page = pageOf(params && params.cursor);
-        // 网页搜索：Yandex 全站 search 有验证码，改走 Bing 拿网页结果
+        // 优先 Yandex 网页搜索；遇验证码时弹 webview 让用户过一次，cookie 会进插件罐
+        const yd = await yandexWebSearch(q, page, ctx);
+        if (yd) return yd;
+        // Yandex 拿不到（验证没通过 / 宿主无 webview）→ 回退 Bing，保证还能搜
         return bingSearch(q, page, ctx);
       },
     },
