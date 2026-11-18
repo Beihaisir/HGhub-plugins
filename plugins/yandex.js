@@ -4,7 +4,7 @@
 export const meta = {
   id: 'yandex',
   name: 'Yandex 视频',
-  version: '1.3.0',
+  version: '1.3.1',
   protocol: 1,
   description: 'Yandex 视频搜索 + VK/NTV/Dzen 直链播放；搜索框可直贴任意网页链接就地提取视频。',
   author: 'workspace',
@@ -24,8 +24,10 @@ const CTL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g;
 export default function (hg) {
   function origin() {
     const cur = hg.endpoint && hg.endpoint.current;
-    if (cur && typeof cur.url === 'string' && cur.url) return cur.url.replace(/\/$/, '');
-    return SITE;
+    let u = cur && typeof cur.url === 'string' ? cur.url.replace(/\/$/, '') : SITE;
+    // yandex.com 已被官方临时关闭（维护页），一律回落到 yandex.ru
+    if (/yandex\.com$/i.test(u) || /yandex\.com\//i.test(u)) return SITE;
+    return u || SITE;
   }
 
   function fail(code, message) {
@@ -54,7 +56,11 @@ export default function (hg) {
     if (cacheTtl) opts.cache = { ttlSec: cacheTtl };
     const res = await hg.http.fetch(opts);
     if (!res.ok) fail('UPSTREAM_ERROR', 'Yandex 返回 HTTP ' + res.status);
-    return res.data || '';
+    const text = res.data || '';
+    if (text.length < 60000 && (/we[’']ll be back/i.test(text) || /temporarily turned off/i.test(text))) {
+      fail('UPSTREAM_ERROR', 'Yandex 站点维护中（官方停机页），换 yandex.ru 或稍后再试');
+    }
+    return text;
   }
 
   function readState(html) {
@@ -320,7 +326,6 @@ export default function (hg) {
       list() {
         return [
           { id: 'ru', label: 'yandex.ru', url: SITE },
-          { id: 'com', label: 'yandex.com', url: 'https://yandex.com' },
         ];
       },
     },
