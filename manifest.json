@@ -1,0 +1,13 @@
+{
+  "name": "HGhub 插件集（Beihaisir）",
+  "description": "HPP 1.0 单文件源合集。相对路径以本列表 URL 为基准。",
+  "plugins": [
+    {
+      "id": "yandex",
+      "name": "Yandex 视频",
+      "version": "1.0.0",
+      "url": "plugins/yandex.js",
+      "description": "Yandex 视频元搜索：搜索、详情、来源标注；播放按 直链 / 播放页 / 外部打开 三级降级。"
+    }
+  ]
+}
