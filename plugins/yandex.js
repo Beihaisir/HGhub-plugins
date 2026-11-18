@@ -4,9 +4,9 @@
 export const meta = {
   id: 'yandex',
   name: 'Yandex 视频',
-  version: '1.2.0',
+  version: '1.3.0',
   protocol: 1,
-  description: 'Yandex 视频元搜索：搜索、详情、封面、来源标注；VK（四档 mp4）、NTV、Dzen 可直接播放。',
+  description: 'Yandex 视频搜索 + VK/NTV/Dzen 直链播放；搜索框可直贴任意网页链接就地提取视频。',
   author: 'workspace',
   kind: 'source',
   linkDomains: ['yandex.ru', 'yandex.com'],
@@ -221,6 +221,69 @@ export default function (hg) {
     return out;
   }
 
+  function isUrl(s) {
+    return /^https?:\/\/[^\s]+$/i.test(String(s || '').trim());
+  }
+
+  function hostOf(u) {
+    const m = /^https?:\/\/([^\/?#]+)/i.exec(String(u || ''));
+    return m ? m[1] : '';
+  }
+
+  function pageTitle(html) {
+    const m = /<title[^>]*>([\s\S]{0,200}?)<\/title>/i.exec(String(html || ''));
+    return m ? clean(m[1].replace(/&amp;/g, '&').replace(/&quot;/g, '"')).slice(0, 90) : '';
+  }
+
+  function findIframes(html) {
+    const out = [];
+    const re = /<iframe[^>]+src=["']([^"']+)["']/gi;
+    let m;
+    while ((m = re.exec(String(html || ''))) !== null) {
+      let u = m[1].replace(/&amp;/g, '&');
+      if (u.indexOf('//') === 0) u = 'https:' + u;
+      if (/^https?:\/\//i.test(u)) out.push(u);
+      if (out.length >= 3) break;
+    }
+    return out;
+  }
+
+  // 贴入任意网页链接：抓页面 -> 找直链 -> 没找到就下一层 iframe
+  async function extractFromUrl(url, ctx) {
+    let html = '';
+    try {
+      html = await fetchText(url, ctx);
+    } catch (e) {
+      return { html: '', urls: [], title: '', error: '页面打不开（' + (e && e.code ? e.code : 'NETWORK') + '）' };
+    }
+    let urls = pickMediaUrls(html);
+    if (!urls.length) {
+      const frames = findIframes(html);
+      for (let i = 0; i < frames.length; i++) {
+        try {
+          const sub = await fetchText(frames[i], ctx);
+          const u2 = pickMediaUrls(sub);
+          if (u2.length) { urls = u2; break; }
+        } catch (e) {}
+      }
+    }
+    return { html: html, urls: urls, title: pageTitle(html) || hostOf(url), error: null };
+  }
+
+  function streamsFromUrls(urls) {
+    const out = [];
+    for (let i = 0; i < urls.length; i++) {
+      const u = urls[i];
+      out.push({
+        url: u,
+        kind: 'media',
+        format: /\.m3u8/i.test(u) ? 'hls' : 'progressive',
+        headers: { 'User-Agent': UA },
+      });
+    }
+    return out;
+  }
+
   // 通用：抓嵌入播放页，从中取直链（ntv / dzen / smotrim 等走这条路）
   async function embedStreams(embedUrl, ctx) {
     if (!embedUrl) return [];
@@ -272,6 +335,24 @@ export default function (hg) {
       async search(params, ctx) {
         const q = params && params.query ? String(params.query).trim() : '';
         if (!q) return { items: [], next: null };
+
+        // 搜索框里直接贴网页链接 -> 就地提取播放地址
+        if (isUrl(q)) {
+          const ex = await extractFromUrl(q, ctx);
+          if (ex.error) return { items: [], next: null };
+          if (!ex.urls.length) return { items: [], next: null };
+          return {
+            items: [{
+              id: q,
+              title: ex.title,
+              type: 'movie',
+              badge: '直取',
+              subtitle: hostOf(q) + ' · ' + ex.urls.length + ' 个播放地址',
+            }],
+            next: null,
+          };
+        }
+
         const page = pageOf(params && params.cursor);
         let url = origin() + '/video/search?text=' + encodeURIComponent(q);
         if (page > 1) url += '&p=' + page;
@@ -289,6 +370,23 @@ export default function (hg) {
       async getDetail(params, ctx) {
         const id = params && params.id ? String(params.id) : '';
         if (!id) fail('INVALID_ARGUMENT', '缺少作品 ID');
+        if (isUrl(id)) {
+          const ex = await extractFromUrl(id, ctx);
+          if (ex.error) fail('UPSTREAM_ERROR', ex.error);
+          if (!ex.urls.length) fail('UNSUPPORTED', '这个页面里没有找到 m3u8 / mp4 地址');
+          const d = {
+            id: id,
+            title: ex.title,
+            type: 'movie',
+            playlists: [{
+              id: 'direct',
+              label: hostOf(id),
+              episodes: [{ id: id, index: 1, episodeNumber: 1, label: ex.urls.length + ' 个地址' }],
+            }],
+            description: '来源：' + hostOf(id) + '\n共找到 ' + ex.urls.length + ' 个播放地址',
+          };
+          return d;
+        }
         const got = await previewEntry(id, ctx);
         const e = got.entry;
         if (!e) fail('UPSTREAM_CHANGED', '未解析到该条目的信息');
@@ -314,6 +412,12 @@ export default function (hg) {
       async resolvePlayback(params, ctx) {
         const episodeId = params && params.episodeId ? String(params.episodeId) : '';
         if (!episodeId) fail('INVALID_ARGUMENT', '缺少分集 ID');
+        if (isUrl(episodeId)) {
+          const ex = await extractFromUrl(episodeId, ctx);
+          if (ex.error) fail('UPSTREAM_ERROR', ex.error);
+          if (!ex.urls.length) fail('UNSUPPORTED', '这个页面里没有找到 m3u8 / mp4 地址');
+          return { streams: streamsFromUrls(ex.urls) };
+        }
         const got = await previewEntry(episodeId, ctx);
         const e = got.entry;
         if (!e) fail('UPSTREAM_CHANGED', '未解析到该条目的播放信息');
