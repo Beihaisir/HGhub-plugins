@@ -3,10 +3,10 @@
 // 直链落在 okcdn.ru（VK 现用 CDN），国内直连实测 206 video/mp4 可用。
 export const meta = {
   id: 'yandex',
-  name: 'Yandex 视频',
-  version: '1.3.1',
+  name: '俄网搜索',
+  version: '1.4.0',
   protocol: 1,
-  description: 'Yandex 视频搜索 + VK/NTV/Dzen 直链播放；搜索框可直贴任意网页链接就地提取视频。',
+  description: '网页搜索（Bing 后端，可搜俄语站）+ 任意链接提取视频 + VK 四档直链播放。',
   author: 'workspace',
   kind: 'source',
   linkDomains: ['yandex.ru', 'yandex.com'],
@@ -276,6 +276,60 @@ export default function (hg) {
     return { html: html, urls: urls, title: pageTitle(html) || hostOf(url), error: null };
   }
 
+  // ---------- Bing 网页搜索（Yandex 网页搜索有验证码，改走 Bing 拿网页结果）----------
+  function decodeEntities(s) {
+    return String(s || '')
+      .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ');
+  }
+
+  function stripTags(s) {
+    return decodeEntities(String(s || '').replace(/<[^>]*>/g, '')).replace(/\s+/g, ' ').trim();
+  }
+
+  function parseBing(html) {
+    const items = [];
+    const parts = String(html || '').split('class="b_algo"');
+    for (let i = 1; i < parts.length && items.length < 20; i++) {
+      const seg = parts[i].slice(0, 5000);
+      const hm = /<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>([\s\S]{0,200}?)<\/a>/i.exec(seg);
+      if (!hm) continue;
+      let url = decodeEntities(hm[1]);
+      if (url.indexOf('/ck/a?') >= 0 || url.indexOf('bing.com/ck/a') >= 0) {
+        const u = /[?&]u=a1([^&]+)/.exec(url);
+        if (u) {
+          try { url = decodeURIComponent(u[1]); } catch (e) { continue; }
+        } else continue;
+      }
+      if (!/^https?:\/\//i.test(url)) continue;
+      const title = stripTags(hm[2]);
+      if (!title) continue;
+      const cite = /<cite[^>]*>([\s\S]{0,160}?)<\/cite>/i.exec(seg);
+      const para = /<p[^>]*>([\s\S]{0,400}?)<\/p>/i.exec(seg);
+      const hostMatch = /^https?:\/\/([^\/?#]+)/i.exec(url);
+      const host = hostMatch ? hostMatch[1] : '';
+      const item = { id: url, title: title.slice(0, 120), type: 'other' };
+      if (host) item.badge = host.replace(/^www\./, '').slice(0, 14);
+      const sub = [];
+      if (host) sub.push(host.replace(/^www\./, ''));
+      const p = para ? stripTags(para[1]) : '';
+      if (p) sub.push(p.slice(0, 70));
+      if (sub.length) item.subtitle = sub.join(' · ');
+      items.push(item);
+    }
+    return items;
+  }
+
+  async function bingSearch(q, page, ctx) {
+    const first = (page - 1) * 10 + 1;
+    let url = 'https://cn.bing.com/search?q=' + encodeURIComponent(q) + '&setlang=ru&count=20';
+    if (first > 1) url += '&first=' + first;
+    const html = await fetchText(url, ctx, 300);
+    const items = parseBing(html);
+    const hasNext = items.length >= 5;
+    return { items: items, next: hasNext ? String(page + 1) : null };
+  }
+
   function streamsFromUrls(urls) {
     const out = [];
     for (let i = 0; i < urls.length; i++) {
@@ -359,15 +413,8 @@ export default function (hg) {
         }
 
         const page = pageOf(params && params.cursor);
-        let url = origin() + '/video/search?text=' + encodeURIComponent(q);
-        if (page > 1) url += '&p=' + page;
-        const html = await fetchText(url, ctx, 120);
-        const state = readState(html);
-        if (!state) fail('UPSTREAM_CHANGED', 'Yandex 页面结构变化，未找到预加载数据');
-        const items = listFrom(state);
-        const s = (state.pages && state.pages.search) || {};
-        const next = s.hasNextPage && items.length ? String(page + 1) : null;
-        return { items: items, next: next };
+        // 网页搜索：Yandex 全站 search 有验证码，改走 Bing 拿网页结果
+        return bingSearch(q, page, ctx);
       },
     },
 
@@ -376,9 +423,19 @@ export default function (hg) {
         const id = params && params.id ? String(params.id) : '';
         if (!id) fail('INVALID_ARGUMENT', '缺少作品 ID');
         if (isUrl(id)) {
+          if (/vk\.com\/video|vk\.com\/clip|vkvideo\.ru\/video/i.test(id)) {
+            const d0 = {
+              id: id,
+              title: 'VK 视频 · ' + hostOf(id),
+              type: 'movie',
+              playlists: [{ id: 'vk', label: 'VK', episodes: [{ id: id, index: 1, episodeNumber: 1, label: '播放' }] }],
+              description: '来源：' + hostOf(id) + '（VK 直链，四档清晰度）',
+            };
+            return d0;
+          }
           const ex = await extractFromUrl(id, ctx);
           if (ex.error) fail('UPSTREAM_ERROR', ex.error);
-          if (!ex.urls.length) fail('UNSUPPORTED', '这个页面里没有找到 m3u8 / mp4 地址');
+          if (!ex.urls.length) fail('UNSUPPORTED', '这个页面里没有找到 m3u8 / mp4 地址，试试用浏览器打开');
           const d = {
             id: id,
             title: ex.title,
@@ -418,9 +475,25 @@ export default function (hg) {
         const episodeId = params && params.episodeId ? String(params.episodeId) : '';
         if (!episodeId) fail('INVALID_ARGUMENT', '缺少分集 ID');
         if (isUrl(episodeId)) {
+          // VK 视频页：走专用解析，四档直链
+          if (/vk\.com\/video|vk\.com\/clip|vkvideo\.ru\/video/i.test(episodeId)) {
+            const vk = await vkStreams(episodeId, ctx);
+            if (vk.length) return { streams: vk };
+          }
+          // Yandex 视频页：先看它是不是 VK 源
+          const ym = /yandex\.[a-z.]+\/video\/preview\/(\d+)/i.exec(episodeId);
+          if (ym) {
+            try {
+              const got0 = await previewEntry(ym[1], ctx);
+              if (got0.entry && got0.entry.playerId === 'vk' && got0.entry.pageUrl) {
+                const vk2 = await vkStreams(got0.entry.pageUrl, ctx);
+                if (vk2.length) return { streams: vk2 };
+              }
+            } catch (e) {}
+          }
           const ex = await extractFromUrl(episodeId, ctx);
           if (ex.error) fail('UPSTREAM_ERROR', ex.error);
-          if (!ex.urls.length) fail('UNSUPPORTED', '这个页面里没有找到 m3u8 / mp4 地址');
+          if (!ex.urls.length) fail('UNSUPPORTED', '这个页面里没有找到 m3u8 / mp4 地址，试试用浏览器打开');
           return { streams: streamsFromUrls(ex.urls) };
         }
         const got = await previewEntry(episodeId, ctx);
