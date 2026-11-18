@@ -5,9 +5,9 @@
     {
       "id": "yandex",
       "name": "俄网搜索",
-      "version": "1.4.0",
+      "version": "1.5.0",
       "url": "plugins/yandex.js",
-      "description": "网页搜索（Bing 后端，可搜俄语站）+ 点开自动提取视频 + VK 四档直链播放。"
+      "description": "Yandex 网页搜索（验证码用 webview 过一次）；不可用时回落 Bing；支持贴链接提取视频与 VK 直链播放。"
     }
   ]
 }
