@@ -1,12 +1,13 @@
-// HGhub HPP 1.0 插件 · Yandex 视频（含 VK 直链解析）
-// 搜索/详情来自 yandex.ru/video 内嵌状态；播放对 VK 来源走 vk.com 的 al_video 接口取多清晰度直链。
-// 直链落在 okcdn.ru（VK 现用 CDN），国内直连实测 206 video/mp4 可用。
+// HGhub HPP 1.0 插件 · 俄网搜索
+// 主路：Yandex 网页搜索（遇验证码用 hg.webview 让用户过一次，凭证存插件 Cookie 罐）
+// 备路：Yandex 不通时回落 Bing 网页搜索；两路都空则返回可点开的诊断条目
+// 附加：搜索框贴任意网页链接就地提取 m3u8/mp4；VK 视频页走 al_video 四档直链
 export const meta = {
   id: 'yandex',
   name: '俄网搜索',
-  version: '1.5.0',
+  version: '1.6.0',
   protocol: 1,
-  description: 'Yandex 网页搜索（含验证码 webview 过检）；Yandex 不可用时回落 Bing；支持贴链接提取视频与 VK 直链播放。',
+  description: 'Yandex 网页搜索（webview 过验证）；回落 Bing；空结果给诊断条目；支持贴链接提取视频与 VK 直链播放。',
   author: 'workspace',
   kind: 'source',
   features: ['webview'],
@@ -52,6 +53,11 @@ export default function (hg) {
       responseType: 'text',
       timeoutMs: 20000,
       maxBytes: 8 * 1024 * 1024,
+      headers: {
+        'User-Agent': UA,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8',
+      },
       signal: ctx && ctx.signal,
     };
     if (cacheTtl) opts.cache = { ttlSec: cacheTtl };
@@ -332,9 +338,7 @@ export default function (hg) {
 
   function hasWebview() {
     try {
-      if (!hg.webview || typeof hg.webview.open !== 'function') return false;
-      const f = hg.env && hg.env.features;
-      return !!(f && f.indexOf && f.indexOf('webview') >= 0);
+      return !!(hg.webview && typeof hg.webview.open === 'function');
     } catch (e) {
       return false;
     }
@@ -529,11 +533,40 @@ export default function (hg) {
         }
 
         const page = pageOf(params && params.cursor);
-        // 优先 Yandex 网页搜索；遇验证码时弹 webview 让用户过一次，cookie 会进插件罐
-        const yd = await yandexWebSearch(q, page, ctx);
-        if (yd) return yd;
-        // Yandex 拿不到（验证没通过 / 宿主无 webview）→ 回退 Bing，保证还能搜
-        return bingSearch(q, page, ctx);
+        const diag = [];
+
+        // ① Yandex 网页搜索（遇验证码弹 webview 过一次）
+        try {
+          const yd = await yandexWebSearch(q, page, ctx);
+          if (yd && yd.items && yd.items.length) return yd;
+          diag.push(yd ? 'Yandex:解析0条' : 'Yandex:被验证码挡');
+        } catch (e) {
+          diag.push('Yandex:' + (e && e.code ? e.code : 'ERR'));
+        }
+
+        // ② 回退 Bing
+        try {
+          const b = await bingSearch(q, page, ctx);
+          if (b.items && b.items.length) {
+            if (diag.length) b.items[0].subtitle = (b.items[0].subtitle || '') + '（Yandex 未通，已用 Bing）';
+            return b;
+          }
+          diag.push('Bing:解析0条');
+        } catch (e) {
+          diag.push('Bing:' + (e && e.code ? e.code : 'ERR'));
+        }
+
+        // ③ 两路都空 → 返回可点开的诊断条目，别让用户面对空列表
+        return {
+          items: [{
+            id: 'diag://' + encodeURIComponent(q),
+            title: '没搜到结果 · 点开看诊断',
+            type: 'other',
+            badge: '诊断',
+            subtitle: diag.join(' / '),
+          }],
+          next: null,
+        };
       },
     },
 
@@ -541,6 +574,17 @@ export default function (hg) {
       async getDetail(params, ctx) {
         const id = params && params.id ? String(params.id) : '';
         if (!id) fail('INVALID_ARGUMENT', '缺少作品 ID');
+        if (id.indexOf('diag://') === 0) {
+          let q0 = '';
+          try { q0 = decodeURIComponent(id.slice(7)); } catch (e) { q0 = id.slice(7); }
+          return {
+            id: id,
+            title: '搜索诊断：' + q0,
+            type: 'other',
+            playlists: [{ id: 'diag', label: '说明', episodes: [{ id: id, index: 1, episodeNumber: 1, label: '查看' }] }],
+            description: '这是一条诊断占位条目：两路搜索都没有拿到结果。\n\n可能原因：\n1) Yandex 验证码未通过（弹窗被关闭或超时）\n2) 宿主网络到 cn.bing.com 不通\n3) 页面结构变化导致解析为空\n\n把这条截图发给维护者，能看到卡在哪一步。',
+          };
+        }
         if (isUrl(id)) {
           if (/vk\.com\/video|vk\.com\/clip|vkvideo\.ru\/video/i.test(id)) {
             const d0 = {
