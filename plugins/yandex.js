@@ -1,13 +1,12 @@
-// HGhub HPP 1.0 插件 · Yandex 视频（元搜索源）
-// 数据来源：yandex.ru/video 搜索页与预览页内嵌的 UniAppVideo-PreloadedState
-// 播放：Yandex 本身不托管视频，条目实际落在 rutube / vk / dzen 等来源。
-//       本插件优先返回可直接播放的直链；拿不到时给出播放页（需解析器）或外部打开地址。
+// HGhub HPP 1.0 插件 · Yandex 视频（含 VK 直链解析）
+// 搜索/详情来自 yandex.ru/video 内嵌状态；播放对 VK 来源走 vk.com 的 al_video 接口取多清晰度直链。
+// 直链落在 okcdn.ru（VK 现用 CDN），国内直连实测 206 video/mp4 可用。
 export const meta = {
   id: 'yandex',
   name: 'Yandex 视频',
-  version: '1.0.0',
+  version: '1.2.0',
   protocol: 1,
-  description: 'Yandex 视频元搜索：搜索、详情、来源标注；播放交给条目所在来源（直链 / 播放页 / 外部打开）。',
+  description: 'Yandex 视频元搜索：搜索、详情、封面、来源标注；VK（四档 mp4）、NTV、Dzen 可直接播放。',
   author: 'workspace',
   kind: 'source',
   linkDomains: ['yandex.ru', 'yandex.com'],
@@ -15,14 +14,14 @@ export const meta = {
     'Accept-Language': 'ru,en;q=0.9',
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
   },
-  timeouts: { read: 25, playback: 25 },
+  timeouts: { read: 25, playback: 30 },
 };
 
 const SITE = 'https://yandex.ru';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+const CTL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g;
 
 export default function (hg) {
-  const CTL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g;
-
   function origin() {
     const cur = hg.endpoint && hg.endpoint.current;
     if (cur && typeof cur.url === 'string' && cur.url) return cur.url.replace(/\/$/, '');
@@ -44,28 +43,25 @@ export default function (hg) {
     return origin() + (u.charAt(0) === '/' ? u : '/' + u);
   }
 
-  async function fetchText(url, ctx) {
-    const res = await hg.http.fetch({
+  async function fetchText(url, ctx, cacheTtl) {
+    const opts = {
       url,
       responseType: 'text',
       timeoutMs: 20000,
-      retry: 1,
-      maxBytes: 12 * 1024 * 1024,
+      maxBytes: 8 * 1024 * 1024,
       signal: ctx && ctx.signal,
-    });
+    };
+    if (cacheTtl) opts.cache = { ttlSec: cacheTtl };
+    const res = await hg.http.fetch(opts);
     if (!res.ok) fail('UPSTREAM_ERROR', 'Yandex 返回 HTTP ' + res.status);
     return res.data || '';
   }
 
-  // noframes#UniAppVideo-PreloadedState 里是整页状态 JSON
   function readState(html) {
     const m = String(html).match(/<noframes[^>]*id="UniAppVideo-PreloadedState"[^>]*>([\s\S]*?)<\/noframes>/i);
     if (!m) return null;
     const raw = m[1];
-    const tries = [
-      raw,
-      raw.replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;/g, "'"),
-    ];
+    const tries = [raw, raw.replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')];
     for (let i = 0; i < tries.length; i++) {
       try { return JSON.parse(tries[i]); } catch (e) {}
     }
@@ -77,7 +73,6 @@ export default function (hg) {
     return Number.isFinite(n) && n > 0 ? n : 1;
   }
 
-  // 从状态里取 clips 结构（搜索页在 clips.*，预览页在 viewer.clips.*）
   function clipsOf(state) {
     if (!state) return null;
     if (state.clips && state.clips.items) return state.clips;
@@ -91,30 +86,24 @@ export default function (hg) {
     const it = items[videoId] || {};
     const d = dups[videoId] || {};
     const poster = it.preview && it.preview.posterSrc;
-    const host = (d.host && d.host.title) || it.greenHost || '';
+    const pl = d.player || {};
     return {
       id: String(videoId),
       title: clean(d.cleanTitle || d.title || it.description || videoId),
       cover: poster ? absUrl(poster) : '',
-      host: clean(host),
+      host: clean((d.host && d.host.title) || it.greenHost || ''),
       durationSec: (d.duration && d.duration.value) || 0,
       durationText: (d.duration && (d.duration.shortText || d.duration.text)) || '',
       views: (d.views && d.views.text) || '',
-      date: d.date || '',
       description: clean(it.description || ''),
-      playerId: (d.player && d.player.playerId) || (d.host && d.host.playerId) || '',
-      embedUrl: (d.player && d.player.embedUrl) || '',
-      pageUrl: (d.player && d.player.videoUrl) || (d.host && d.host.href) || '',
-      href: d.href || d.rawHref || '',
+      playerId: pl.playerId || (d.host && d.host.playerId) || '',
+      embedUrl: pl.embedUrl || '',
+      pageUrl: pl.videoUrl || (d.host && d.host.href) || '',
     };
   }
 
   function toItem(e) {
-    const item = {
-      id: e.id,
-      title: e.title,
-      type: e.durationSec && e.durationSec > 5400 ? 'movie' : 'other',
-    };
+    const item = { id: e.id, title: e.title, type: 'other' };
     if (e.cover) item.cover = e.cover;
     const badge = e.host ? e.host.slice(0, 8) : '';
     if (badge) item.badge = badge;
@@ -129,30 +118,24 @@ export default function (hg) {
     const clips = clipsOf(state);
     if (!clips) return [];
     const ids = Object.keys(clips.items || {});
-    return ids
-      .map(function (id) { return clips.items[id] || {}; })
-      .map(function (it, i) { return { it: it, i: i }; })
-      .sort(function (a, b) {
-        const pa = parseInt(a.it.position, 10);
-        const pb = parseInt(b.it.position, 10);
-        return (Number.isFinite(pa) ? pa : a.i) - (Number.isFinite(pb) ? pb : b.i);
-      })
-      .map(function (w) { return toItem(entryOf(clips, w.it.videoId)); })
-      .filter(function (x) { return x.id && x.title; });
-  }
-
-  async function searchPage(query, page, ctx) {
-    let url = origin() + '/video/search?text=' + encodeURIComponent(query);
-    if (page > 1) url += '&p=' + page;
-    const html = await fetchText(url, ctx);
-    const state = readState(html);
-    if (!state) fail('UPSTREAM_CHANGED', 'Yandex 页面结构变化，未找到预加载数据');
-    const s = (state.pages && state.pages.search) || {};
-    const items = listFrom(state);
-    let next = null;
-    if (s.hasNextPage) next = String(page + 1);
-    else if (items.length) next = null;
-    return { items: items, next: next };
+    const arr = [];
+    for (let i = 0; i < ids.length; i++) {
+      const it = clips.items[ids[i]] || {};
+      arr.push({ it: it, i: i });
+    }
+    arr.sort(function (a, b) {
+      const pa = parseInt(a.it.position, 10);
+      const pb = parseInt(b.it.position, 10);
+      const va = Number.isFinite(pa) ? pa : 1000 + a.i;
+      const vb = Number.isFinite(pb) ? pb : 1000 + b.i;
+      return va - vb;
+    });
+    const out = [];
+    for (let j = 0; j < arr.length; j++) {
+      const item = toItem(entryOf(clips, arr[j].it.videoId));
+      if (item.id && item.title) out.push(item);
+    }
+    return out;
   }
 
   async function previewEntry(videoId, ctx) {
@@ -160,8 +143,113 @@ export default function (hg) {
     const html = await fetchText(url, ctx);
     const state = readState(html);
     const clips = clipsOf(state);
-    if (!clips) return { entry: null, html: html };
-    return { entry: entryOf(clips, videoId), html: html };
+    return { entry: clips ? entryOf(clips, videoId) : null, html: html };
+  }
+
+  // VK：al_video 接口一次返回四档清晰度的直链（okcdn.ru）
+  async function vkStreams(pageUrl, ctx) {
+    const m = /(?:video|clip)(-?\d+)_(\d+)/.exec(String(pageUrl || ''));
+    if (!m) return [];
+    let res;
+    try {
+      res = await hg.http.fetch({
+        url: 'https://vk.com/al_video.php?act=show',
+        method: 'POST',
+        headers: {
+          Referer: 'https://vk.com/',
+          'X-Requested-With': 'XMLHttpRequest',
+          'Accept-Language': 'ru,en;q=0.9',
+        },
+        body: { form: { act: 'show', al: '1', video: m[1] + '_' + m[2] } },
+        responseType: 'text',
+        timeoutMs: 20000,
+        maxBytes: 8 * 1024 * 1024,
+        signal: ctx && ctx.signal,
+      });
+    } catch (e) {
+      return [];
+    }
+    if (!res || !res.ok) return [];
+    const body = String(res.data || '');
+    const defs = [['720', '720P', 720], ['480', '480P', 480], ['360', '360P', 360], ['240', '240P', 240]];
+    const out = [];
+    for (let i = 0; i < defs.length; i++) {
+      const re = new RegExp('"url' + defs[i][0] + '"\\s*:\\s*"([^"]+)"');
+      const mm = re.exec(body);
+      if (!mm || !mm[1]) continue;
+      out.push({
+        url: mm[1].replace(/\\\//g, '/'),
+        kind: 'media',
+        format: 'progressive',
+        label: defs[i][1],
+        height: defs[i][2],
+        headers: { 'User-Agent': UA },
+      });
+    }
+    return out;
+  }
+
+  // 通用：从嵌入页 HTML 里拾取 m3u8 / mp4 地址
+  function pickMediaUrls(body) {
+    const out = [];
+    const seen = {};
+    const marks = ['.m3u8', '.mp4'];
+    for (let k = 0; k < marks.length; k++) {
+      let idx = 0;
+      while (true) {
+        const at = body.indexOf(marks[k], idx);
+        if (at < 0) break;
+        idx = at + 1;
+        const start = body.lastIndexOf('http', at);
+        if (start < 0) continue;
+        const head = body.slice(start, start + 5);
+        if (head !== 'http:' && head !== 'https') continue;
+        let end = at + marks[k].length;
+        while (end < body.length && end - start < 500) {
+          const ch = body.charAt(end);
+          if (ch === '"' || ch === "'" || ch === ' ' || ch === '\n' || ch === '\r' || ch === '\\' || ch === '<' || ch === '>') break;
+          end++;
+        }
+        const u = body.slice(start, end).replace(/&amp;/g, '&');
+        if (u.length > 20 && !seen[u]) {
+          seen[u] = 1;
+          out.push(u);
+        }
+        if (out.length >= 4) return out;
+      }
+    }
+    return out;
+  }
+
+  // 通用：抓嵌入播放页，从中取直链（ntv / dzen / smotrim 等走这条路）
+  async function embedStreams(embedUrl, ctx) {
+    if (!embedUrl) return [];
+    let res;
+    try {
+      res = await hg.http.fetch({
+        url: embedUrl,
+        responseType: 'text',
+        timeoutMs: 15000,
+        maxBytes: 8 * 1024 * 1024,
+        headers: { Referer: origin() + '/' },
+        signal: ctx && ctx.signal,
+      });
+    } catch (e) {
+      return [];
+    }
+    if (!res || !res.ok) return [];
+    const urls = pickMediaUrls(String(res.data || ''));
+    const out = [];
+    for (let i = 0; i < urls.length; i++) {
+      const u = urls[i];
+      out.push({
+        url: u,
+        kind: 'media',
+        format: /\.m3u8/i.test(u) ? 'hls' : 'progressive',
+        headers: { 'User-Agent': UA },
+      });
+    }
+    return out;
   }
 
   return {
@@ -176,7 +264,6 @@ export default function (hg) {
 
     home: {
       async getSections() {
-        // Yandex 视频没有稳定的无参首页，首页留给搜索入口
         return { items: [], next: null };
       },
     },
@@ -185,7 +272,16 @@ export default function (hg) {
       async search(params, ctx) {
         const q = params && params.query ? String(params.query).trim() : '';
         if (!q) return { items: [], next: null };
-        return searchPage(q, pageOf(params && params.cursor), ctx);
+        const page = pageOf(params && params.cursor);
+        let url = origin() + '/video/search?text=' + encodeURIComponent(q);
+        if (page > 1) url += '&p=' + page;
+        const html = await fetchText(url, ctx, 120);
+        const state = readState(html);
+        if (!state) fail('UPSTREAM_CHANGED', 'Yandex 页面结构变化，未找到预加载数据');
+        const items = listFrom(state);
+        const s = (state.pages && state.pages.search) || {};
+        const next = s.hasNextPage && items.length ? String(page + 1) : null;
+        return { items: items, next: next };
       },
     },
 
@@ -196,27 +292,19 @@ export default function (hg) {
         const got = await previewEntry(id, ctx);
         const e = got.entry;
         if (!e) fail('UPSTREAM_CHANGED', '未解析到该条目的信息');
-        const label = e.host || '播放';
         const detail = {
           id: e.id,
           title: e.title,
           type: 'movie',
           playlists: [{
             id: 'yandex',
-            label: label,
-            episodes: [{
-              id: e.id,
-              index: 1,
-              episodeNumber: 1,
-              label: e.durationText || '播放',
-            }],
+            label: e.host || '播放',
+            episodes: [{ id: e.id, index: 1, episodeNumber: 1, label: e.durationText || '播放' }],
           }],
         };
         if (e.cover) detail.cover = e.cover;
         const desc = [];
-        if (e.host) desc.push('来源：' + e.host);
-        if (e.date) desc.push(e.date);
-        if (e.views) desc.push(e.views + ' 次观看');
+        if (e.host) desc.push('来源：' + e.host + (e.playerId === 'vk' ? '（可直接播放）' : ''));
         if (e.description) desc.push(e.description);
         if (desc.length) detail.description = desc.join('\n');
         if (e.durationSec) detail.durationSec = e.durationSec;
@@ -232,30 +320,39 @@ export default function (hg) {
 
         const streams = [];
 
-        // 1) 页面里若有可直接播放的媒体地址，优先给出
-        const direct = String(got.html).match(/https?:\\?\/\\?\/[^"'\s\\]+?\.(?:m3u8|mp4)(?:\?[^"'\s\\]*)?/i);
-        if (direct) {
-          const u = direct[0].replace(/\\\//g, '/').replace(/\\u002F/g, '/');
-          streams.push({
-            url: u,
-            kind: 'media',
-            format: /\.m3u8/i.test(u) ? 'hls' : 'progressive',
-            headers: { Referer: origin() + '/' },
-          });
+        if (e.playerId === 'vk' && e.pageUrl) {
+          const vk = await vkStreams(e.pageUrl, ctx);
+          for (let i = 0; i < vk.length; i++) streams.push(vk[i]);
         }
 
-        // 2) 常驻的嵌入播放页：交给同 id 的解析器插件处理
-        if (e.embedUrl) {
-          const s = { url: e.embedUrl, kind: 'page', headers: { Referer: origin() + '/' } };
+        if (!streams.length && e.embedUrl) {
+          const em = await embedStreams(e.embedUrl, ctx);
+          for (let i = 0; i < em.length; i++) streams.push(em[i]);
+        }
+
+        if (!streams.length) {
+          const direct = String(got.html).match(/https?:\\?\/\\?\/[^"'\s\\]+?\.(?:m3u8|mp4)(?:\?[^"'\s\\]*)?/i);
+          if (direct) {
+            const u = direct[0].replace(/\\\//g, '/').replace(/\\u002F/g, '/');
+            streams.push({
+              url: u,
+              kind: 'media',
+              format: /\.m3u8/i.test(u) ? 'hls' : 'progressive',
+              headers: { 'User-Agent': UA },
+            });
+          }
+        }
+
+        if (!streams.length && e.embedUrl) {
+          const s = { url: e.embedUrl, kind: 'page', headers: { 'User-Agent': UA } };
           if (e.playerId) s.resolverId = e.playerId;
           streams.push(s);
         }
-
-        // 3) 兜底：外部打开来源页面
-        if (e.pageUrl) streams.push({ url: e.pageUrl, kind: 'external' });
-
+        if (!streams.length && e.pageUrl) {
+          streams.push({ url: e.pageUrl, kind: 'external' });
+        }
         if (!streams.length) {
-          fail('UNSUPPORTED', '该条目没有可用的播放地址（来源：' + (e.host || '未知') + '）');
+          fail('UNSUPPORTED', '该条目没有可用播放地址（来源：' + (e.host || '未知') + '）');
         }
         return { streams: streams, durationSec: e.durationSec || undefined };
       },
